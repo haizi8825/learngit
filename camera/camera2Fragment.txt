@@ -1,0 +1,636 @@
+package cn.com.aratek.iattendance.module.camera;
+
+import android.graphics.Bitmap;
+import android.graphics.Matrix;
+import android.graphics.Rect;
+import android.graphics.SurfaceTexture;
+import android.hardware.Camera;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.SystemClock;
+import android.support.annotation.Nullable;
+import android.support.v4.app.Fragment;
+import android.support.v4.app.FragmentActivity;
+import android.util.Log;
+import android.view.LayoutInflater;
+import android.view.TextureView;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.ImageView;
+
+import com.arcsoft.face.Face3DAngle;
+import com.arcsoft.face.FaceEngine;
+import com.arcsoft.face.FaceInfo;
+import com.arcsoft.face.LivenessInfo;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Vector;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import cn.com.aratek.aralogger.AraLogger;
+import cn.com.aratek.iattendance.R;
+import cn.com.aratek.iattendance.base.App;
+import cn.com.aratek.iattendance.data.instance.Config;
+import cn.com.aratek.iattendance.utils.CommonUtil;
+import cn.com.aratek.iattendance.utils.FaceServiceUtil;
+import cn.com.aratek.iattendance.utils.NV21ToBitmap;
+import cn.com.aratek.iattendance.utils.SpUtil;
+import cn.com.aratek.iattendance.utils.ThreadPoolFactory;
+import cn.com.aratek.iattendance.view.OverlayDialog;
+import io.reactivex.BackpressureStrategy;
+import io.reactivex.Flowable;
+import io.reactivex.FlowableOnSubscribe;
+import io.reactivex.Observable;
+import io.reactivex.android.schedulers.AndroidSchedulers;
+import io.reactivex.disposables.Disposable;
+import io.reactivex.schedulers.Schedulers;
+
+/**
+ * $desc$
+ *
+ * @author shuyun
+ * @created on 2018/8/31 0031 15:40
+ * @changed on 2018/8/31 0031 15:40
+ */
+public class CameraDualFragment1 extends Fragment implements CameraInterface {
+    private TextureView ttvRGB;
+    private FaceView faceView;
+    private Camera cameraRGB;
+    private ImageView iv_temp_face;
+    private FaceProcessCallback faceProcessCallback;
+    private int cameraId4RGB = 0;
+
+    /**
+     * define for faces checked
+     **/
+    private volatile boolean isChecking = false;
+    private volatile boolean hasFace = false;
+    private volatile float[] facePosition = new float[]{-1, 0, 0, 0};
+
+    private volatile int status = Config.DEVICE_MODE_ARATEK;
+    private volatile long lastCountCheckTime = 0;
+    private AtomicInteger atomicCount = new AtomicInteger(0);
+    private final int fCount4FakeFace = 4;
+    private volatile boolean isFakeFace;
+
+    private FaceServiceUtil mFaceService;
+    private volatile int faceIdCache = -100;
+    private FakeFaceProcessCallback fakeFaceProcessCallback;
+    private volatile Vector<Integer> verifyFaidVector;
+    private volatile long currentTime = 0;
+    private OnTipsUpdateListener tipsListener;
+    private boolean isStop;
+    private OverlayDialog overlayDialog;
+    private volatile byte[] rgbData;
+    private byte[] buffer;
+    private int currentIndex;
+    private int PROCESS_INTERVAL = 3;
+    private Matrix matrix ;
+    private volatile FaceInfo currentFaceInfo;
+    private final int maxX = 897;
+    private final int minX = 129;
+    private FragmentActivity mContext;
+    private Disposable previewDiaposable;
+    @Override
+    public void setFaceProcessCallback(FaceProcessCallback callback) {
+        faceProcessCallback = callback;
+    }
+
+    @Override
+    public void setFaceProcessCallback4FakeFace(FakeFaceProcessCallback callback) {
+        fakeFaceProcessCallback = callback;
+    }
+
+
+    @Override
+    public void setCaptureCallback(CaptureCallback callback) {
+
+    }
+
+    @Override
+    public void setCameraId(int id) {
+
+    }
+
+    @Override
+    public void enableCapture(boolean enable) {
+    }
+
+    @Override
+    public void enableFlash(boolean enable) {
+    }
+
+    @Override
+    public int getCameraOrientation() {
+        Camera.CameraInfo info = new Camera.CameraInfo();
+        Camera.getCameraInfo(cameraId4RGB, info);
+        int r = mContext.getWindowManager().getDefaultDisplay().getRotation();
+        return (r * 90 + info.orientation + 360) % 360;
+
+    }
+
+
+    @Override
+    public boolean hasFace() {
+        return hasFace;
+    }
+
+    @Override
+    public float[] getFacePosition() {
+        return facePosition;
+    }
+
+    @Override
+    public void setFaceViewEnable(boolean enable) {
+        Disposable d = Observable.just(1)
+                .observeOn(AndroidSchedulers.mainThread())
+                .map(integer -> {
+                    if (faceView != null) {
+                        if (enable) {
+                            faceView.setVisibility(View.VISIBLE);
+                        } else {
+                            faceView.setVisibility(View.INVISIBLE);
+                        }
+                    }
+                    return integer;
+                })
+                .subscribe(integer -> {
+                }, throwable -> AraLogger.e(throwable.getMessage()));
+    }
+
+    @Override
+    public Bitmap getCapture() {
+        return ttvRGB.getBitmap();
+    }
+
+
+    @Override
+    public Bitmap getBitmap() {
+        Bitmap bitmap = null;
+        if (currentFaceInfo != null){
+            bitmap = NV21ToBitmap.getInstance(mContext).nv21ToBitmap(rgbData, Config.PREVIEW_WIDTH, Config.PREVIEW_HEIGHT);
+            bitmap = Bitmap.createBitmap(bitmap, currentFaceInfo.getRect().left, currentFaceInfo.getRect().top, currentFaceInfo.getRect().width(), currentFaceInfo.getRect().height());
+        }
+        return bitmap;
+    }
+    @Override
+    public Bitmap getBitmap(byte[] data,FaceInfo faceInfo) {
+        Bitmap bitmap = NV21ToBitmap.getInstance(getContext()).nv21ToBitmap(data, Config.PREVIEW_WIDTH, Config.PREVIEW_HEIGHT);
+        if (matrix == null){
+            matrix = new Matrix();
+            matrix.postScale(-1 , 1);
+        }
+        bitmap = Bitmap.createBitmap(bitmap, 160, 0, 320, 480 , matrix , true);
+        return bitmap;
+    }
+    @Override
+    public void addFailedFaceId(int faceId) {
+        if (!SpUtil.getBoolean(Config.KEY_SAME_PERSON_FILTER, true))
+            return;
+        verifyFaidVector.add(faceId);
+    }
+
+    @Override
+    public void setTipsUpdateListener(OnTipsUpdateListener listener) {
+        tipsListener = listener;
+    }
+
+
+    @Nullable
+    @Override
+    public View onCreateView(LayoutInflater inflater, @Nullable ViewGroup container, Bundle savedInstanceState) {
+        Log.e("CameraDualFragment", "onCreateView");
+        mContext=getActivity();
+        View view = LayoutInflater.from(mContext).inflate(R.layout.layout_square_camerafragment, null);
+        if (Config.DEVICE_MODE_ARATEK_8100.equals(Build.MODEL) || Config.DEVICE_MODE_ARATEK_8200.equals(Build.MODEL)) {
+            status = Config.DEVICE_MODE_ARATEK;
+            cameraId4RGB = 0;
+        } else {
+            status = Config.DEVICE_MODE_WQH;
+            cameraId4RGB = 0;
+        }
+//        ttvLazer = view.findViewById(R.id.ttv_camera1);
+        ttvRGB = view.findViewById(R.id.ttv_camera0);
+        faceView = view.findViewById(R.id.faceView);
+        ttvRGB.setSurfaceTextureListener(listenerRGB);
+        iv_temp_face = view.findViewById(R.id.iv_face_temp);
+        if (SpUtil.getBoolean(Config.KEY_AUTO_TEMP , false)){
+            iv_temp_face.setVisibility(View.VISIBLE);
+        }else{
+            iv_temp_face.setVisibility(View.GONE);
+        }
+//        ttvLazer.setSurfaceTextureListener(listenerLaser);
+        mFaceService = FaceServiceUtil.getInstance(App.getInstance());
+        verifyFaidVector = new Vector<>();
+        overlayDialog = OverlayDialog.getInstance(mContext);
+        overlayDialog.setLastDetectFaceTime(System.currentTimeMillis());
+        return view;
+    }
+
+    @Override
+    public void onStart() {
+        super.onStart();
+        isStop = false;
+        isChecking = false;
+        AraLogger.d("CameraDualFragment onStart");
+    }
+
+    @Override
+    public void onStop() {
+        super.onStop();
+        isStop = true;
+        AraLogger.d("CameraDualFragment onStop");
+    }
+
+    private TextureView.SurfaceTextureListener listenerRGB = new TextureView.SurfaceTextureListener() {
+        @Override
+        public void onSurfaceTextureAvailable(SurfaceTexture surface, int width, int height) {
+            AraLogger.d("onSurfaceTextureAvailable");
+
+            try {
+                try {
+                    cameraRGB = Camera.open(cameraId4RGB);
+                } catch (Exception e) {
+                    AraLogger.e("尝试打开摄像头RGB失败 " + e.getMessage());
+                    SystemClock.sleep(100);
+                    cameraRGB = Camera.open(cameraId4RGB);
+                }
+                Camera.CameraInfo info = new Camera.CameraInfo();
+                Camera.getCameraInfo(cameraId4RGB, info);
+                Camera.Parameters parameters = cameraRGB.getParameters();
+                parameters.setPreviewSize(Config.PREVIEW_WIDTH, Config.PREVIEW_HEIGHT);
+                int orientation = getCameraOrientation();
+                cameraRGB.setDisplayOrientation(orientation);
+
+                cameraRGB.cancelAutoFocus();
+                cameraRGB.setParameters(parameters);
+//                cameraRGB.setPreviewCallback(previewCallbackRGB);
+                buffer = new byte[Config.PREVIEW_WIDTH * Config.PREVIEW_HEIGHT * 3 / 2];
+                cameraRGB.addCallbackBuffer(buffer);
+                cameraRGB.addCallbackBuffer(buffer);
+                cameraRGB.addCallbackBuffer(buffer);
+                cameraRGB.setPreviewCallbackWithBuffer(previewCallbackRGB);
+
+                try {
+                    cameraRGB.setPreviewTexture(surface);
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+                cameraRGB.startPreview();
+            } catch (Exception e) {
+                AraLogger.e("初始化RGB摄像头错误 " + e.getMessage());
+            }
+        }
+
+        @Override
+        public void onSurfaceTextureSizeChanged(SurfaceTexture surface, int width, int height) {
+            AraLogger.d("onSurfaceTextureSizeChanged");
+        }
+
+        @Override
+        public boolean onSurfaceTextureDestroyed(SurfaceTexture surface) {
+            AraLogger.d("onSurfaceTextureDestroyed");
+            try {
+                if (cameraRGB != null) {
+                    cameraRGB.stopPreview();
+                    cameraRGB.setPreviewCallbackWithBuffer(null);
+//                    cameraRGB.setPreviewCallback(null);
+                    cameraRGB.release();
+                    cameraRGB = null;
+                }
+            } catch (Exception e) {
+                AraLogger.e("onSurfaceTextureDestroyed中释放RGBCamera发生错误 " + e.getMessage());
+            }
+            return true;
+        }
+
+        @Override
+        public void onSurfaceTextureUpdated(SurfaceTexture surface) {
+//            AraLogger.d("onSurfaceTextureUpdated");
+        }
+    };
+
+
+    private volatile long time;
+    private Camera.PreviewCallback previewCallbackRGB = (data, camera) -> {
+        if (data == null || data.length != Config.PREVIEW_WIDTH * Config.PREVIEW_HEIGHT * 3 / 2) {
+            AraLogger.e("相机回调数组==null或数组长度不对");
+            isChecking = false;
+            return;
+        }
+
+        camera.addCallbackBuffer(buffer);
+        try {
+            checkFace(data, camera);
+        } catch (Exception e) {
+            isChecking = false;
+            AraLogger.e("相机回调异常" + e.getMessage());
+        }
+    };
+
+
+    private void checkFace(byte[] data, Camera camera) {
+        if (isStop) {
+            isChecking = false;
+            return;
+        }
+//        if (currentIndex == Integer.MAX_VALUE - 100) {
+//            currentIndex = 0;
+//        }
+//        if (currentIndex++ % PROCESS_INTERVAL != 0) {
+//            return;
+//        }
+        if (isChecking|| overlayDialog.isShowing() || !isAdded()) {
+//            AraLogger.e("checkFace正在进行人脸检测");
+            return;
+        }
+        isChecking = true;
+        rgbData = data;
+//        previewDiaposable = Observable.just(1)
+//         .observeOn(Schedulers.from(ThreadPoolFactory.getInstance().obtainCameraPool()))
+//                .flatMap(integer ->  {
+//                    return Observable.just(mFaceService.detectFaces(rgbData, Config.PREVIEW_WIDTH, Config.PREVIEW_HEIGHT, FaceEngine.CP_PAF_NV21));
+//                })
+        //这里用Flowable替代Observable是为了解决背压的问题，在弱网环境下线程任务阻塞出现的很频繁
+        previewDiaposable = Flowable.create((FlowableOnSubscribe<Integer>) emitter -> {
+            emitter.onNext(1);
+        }, BackpressureStrategy.DROP)
+                .observeOn(Schedulers.from(ThreadPoolFactory.getInstance().obtainCameraPool()))
+                .flatMap(integer -> Flowable.create((FlowableOnSubscribe<List<FaceInfo>>) emitter -> {
+                    emitter.onNext(mFaceService.detectFaces(rgbData, Config.PREVIEW_WIDTH, Config.PREVIEW_HEIGHT, FaceEngine.CP_PAF_NV21));
+                }, BackpressureStrategy.DROP))
+                .map(faceInfos -> {
+                    //过滤出没在画面中的人
+                    if (!faceInfos.isEmpty()) {
+                        Iterator<FaceInfo> iterator = faceInfos.iterator();
+                        while (iterator.hasNext()) {
+                            FaceInfo faceInfo = iterator.next();
+                            if (!isValidRect(faceInfo.getRect())) {
+                                iterator.remove();
+                            }
+                        }
+                    }
+                    return faceInfos;
+                })
+                .map(faceInfoList -> {
+                    if (!faceInfoList.isEmpty()) {
+//                        AraLogger.e("检测到预览矩形内有人脸");
+                        List<Face3DAngle> face3DAngleList = mFaceService.getFace3DAngle(rgbData, Config.PREVIEW_WIDTH, Config.PREVIEW_HEIGHT, faceInfoList);
+                        return CommonUtil.filterValid3DAngleFace(faceInfoList, face3DAngleList);
+                    }
+                    return faceInfoList;
+                })
+                .map(faceInfoList -> {
+                    if (!faceInfoList.isEmpty()) {
+                        if (App.isAutoNotifyScreen) {
+                            overlayDialog.setLastDetectFaceTime(System.currentTimeMillis());
+                        }
+//                        AraLogger.e("检测到预览矩形内有人脸并且三维角度有效");
+                        FaceInfo faceInfo = getDiffFace(faceInfoList);
+                        currentFaceInfo = faceInfo;
+                        if (faceInfo == null || faceInfo.getOrient() == 0) {
+                            hasFace = false;
+                            atomicCount.set(0);//没有人脸要清空活体检测次数
+                            isFakeFace = false;
+                            if (faceProcessCallback != null) {
+                                //为了检测相机是否有未回调的情况，需要调用此方法刷新相机最新一帧的时间
+                                faceProcessCallback.callback(null, null);
+                            }
+//                            Log.e("whb", "问题调试：检测到匹配人脸，但被过滤了");
+                        } else {
+                            if (tipsListener != null) {
+                                tipsListener.updateTips(getString(R.string.welcome));
+                            }
+                            hasFace = true;
+//                            LongLightUtils.openWakeLock(getActivity(), CameraDualFragment1.class.getName());
+                            boolean isLiveMode = App.mIsEnableAliveFace == 1 || App.mIsEnableAliveFace == 2;
+                            if (isLiveMode) {
+                                long start = System.currentTimeMillis();
+                                LivenessInfo livenessInfo = mFaceService.detectLivenessInfo(rgbData, Config.PREVIEW_WIDTH, Config.PREVIEW_HEIGHT, faceInfo);
+                                boolean isLiving = livenessInfo != null && livenessInfo.getLiveness() == 1;
+                                if (isLiving) {
+                                    lastCountCheckTime = System.currentTimeMillis();
+                                    atomicCount.set(0);//清空活体检测次数
+                                    isFakeFace = false;
+                                    if (faceProcessCallback != null) {
+//                                        faceProcessCallback.callback(Arrays.copyOf(data, data.length), faceInfo);
+                                        faceProcessCallback.callback(rgbData, faceInfo);
+                                    }
+//                                    Log.e("whb", "问题调试：检测到活体，执行回调");
+                                } else {
+                                    faceIdCache = -100;
+                                    verifyFaidVector.clear();
+                                    if (lastCountCheckTime != 0 && System.currentTimeMillis() - lastCountCheckTime > 3000) {
+                                        //一定时间之后，清空检测次数
+                                        atomicCount.set(0);
+                                    }
+                                    lastCountCheckTime = System.currentTimeMillis();
+                                    int count = atomicCount.addAndGet(1);//检测结果为假体的结果次数 增加
+                                    if (count >= fCount4FakeFace) {
+                                        isFakeFace = true;
+                                        atomicCount.set(0);
+                                    }
+                                    if (App.mIsEnableFakeFaceAlarm) {
+                                        if (fakeFaceProcessCallback != null) {
+                                            if (isFakeFace) {
+//                                                fakeFaceProcessCallback.callback(Arrays.copyOf(data, data.length), faceInfo, true);
+                                                fakeFaceProcessCallback.callback(rgbData, faceInfo, true);
+                                            } else {
+                                                fakeFaceProcessCallback.callback(null, null, true);
+                                            }
+                                        }
+                                    } else {
+                                        hasFace = false;
+                                        atomicCount.set(0);//没有人脸要清空活体检测次数
+                                        isFakeFace = false;
+                                        if (faceProcessCallback != null) {
+                                            faceProcessCallback.callback(null, null);
+                                        }
+                                    }
+                                }
+                            } else {
+                                if (faceProcessCallback != null) {
+//                                    faceProcessCallback.callback(Arrays.copyOf(data, data.length), faceInfo);
+                                    faceProcessCallback.callback(rgbData, faceInfo);
+                                }
+                            }
+                        }
+                    } else {
+                        currentFaceInfo = null;
+                        if (tipsListener != null) {
+                            tipsListener.updateTips(getString(R.string.welcome));
+                        }
+                        faceIdCache = -100;
+                        verifyFaidVector.clear();
+                        hasFace = false;
+                        atomicCount.set(0);//没有人脸要清空活体检测次数
+                        isFakeFace = false;
+                        if (faceProcessCallback != null) {
+                            faceProcessCallback.callback(null, null);
+                        }
+//                        Log.e("whb", "问题调试：未检测到人脸");
+                    }
+                    return faceInfoList;
+                })
+                .observeOn(AndroidSchedulers.mainThread())
+                .map(faceInfos -> {
+                    changeScreenStatus();
+                    return faceInfos;
+                })
+                .timeout(5, TimeUnit.SECONDS)
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(faceInfoList -> {
+                    List<Rect> rectList = getRectList(faceInfoList);
+                    faceView.setRectList(rectList);
+                    isChecking = false;
+                }, throwable -> {
+                    AraLogger.e("人脸识别过程异常：" + throwable.getMessage());
+                    isChecking = false;
+                });
+    }
+
+
+    /**
+     * 根据检测人脸情况来确定是否显示息屏的View
+     */
+    private void changeScreenStatus() {
+        if (System.currentTimeMillis() - overlayDialog.getLastDetectFaceTime() > App.delayOffScreenTime * 1000) {
+            //最后一次检测人脸在指定时间外，并且没有在点击息屏VIEW控制时间内则显示息屏View
+            OverlayDialog.getInstance(mContext).show();
+        } else {
+            OverlayDialog.getInstance(mContext).dismiss();
+        }
+    }
+
+    //判断人脸是否超出展示界面
+    private boolean isValidRect(Rect rect) {
+
+        if (rect==null||rect.isEmpty()) return false;
+
+        return rect.centerX() >= minX && rect.centerX() <= maxX;//640*480
+    }
+
+
+    private List<Rect> getRectList(List<FaceInfo> faceInfos) {
+        ArrayList<Rect> list = new ArrayList<>();
+        if (faceInfos != null && !faceInfos.isEmpty()) {
+            for (FaceInfo faceInfo : faceInfos) {
+                Rect rect = faceInfo.getRect();
+                Rect rect1 = new Rect();
+                float horizontalRatio = (float) 1440 / (float) Config.PREVIEW_WIDTH;
+                float verticalRatio = (float) 1080 / (float) Config.PREVIEW_HEIGHT;
+                int temp = rect.left;
+                rect1.left = 1440 - (int) (rect.right * horizontalRatio) ;
+                rect1.top = (int) (rect.top * verticalRatio);
+                rect1.right = 1440 - (int) (temp * horizontalRatio) ;
+                rect1.bottom = (int) (rect.bottom * verticalRatio);
+                if (rect1.left < 0) {
+                    rect1.left = 0;
+                }
+                if (rect1.right < 0) {
+                    rect1.right = 0;
+                }
+                list.add(rect1);
+            }
+        }
+        return list;
+    }
+
+
+    /**
+     * 检验是不是同张脸
+     *
+     * @param faceInfoList
+     */
+    private FaceInfo getDiffFace(List<FaceInfo> faceInfoList) {
+        if (!SpUtil.getBoolean(Config.KEY_SAME_PERSON_FILTER, true)) {
+            //不开同人过滤，取最大一张人脸进行识别
+            FaceInfo maxFaceInfo = new FaceInfo();
+            for (FaceInfo faceInfo : faceInfoList) {
+                if (faceInfo.getRect().width() < CommonUtil.getMinIdentifyWidth(2, SpUtil.getFloat(Config.KEY_MAX_RECOGNIZE_DISTANCE, 1.5f), App.DEVICE_MODEL))
+                    continue;
+                if (faceInfo.getRect().width() > maxFaceInfo.getRect().width()) {
+                    maxFaceInfo = faceInfo;
+                }
+            }
+            if (maxFaceInfo.getOrient() == 0) {
+                //Orient证明过滤后没有合适的人脸比对
+                if (tipsListener != null) {
+                    tipsListener.updateTips("请靠近一点");
+                }
+            }
+            return maxFaceInfo;
+        }
+        FaceInfo maxFaceInfo = new FaceInfo();
+        for (FaceInfo faceInfo : faceInfoList) {
+            if (faceInfo.getRect().width() < CommonUtil.getMinIdentifyWidth(2, SpUtil.getFloat(Config.KEY_MAX_RECOGNIZE_DISTANCE, 1.5f), App.DEVICE_MODEL))
+                continue;
+            if (faceInfo.getRect().width() > maxFaceInfo.getRect().width()) {
+                maxFaceInfo = faceInfo;
+            }
+        }
+        if (maxFaceInfo.getOrient() == 0) {
+            //Orient证明过滤后没有合适的人脸比对
+            if (tipsListener != null) {
+                tipsListener.updateTips("请靠近一点");
+            }
+        }
+        if (verifyFaidVector.contains(maxFaceInfo.getFaceId()) && maxFaceInfo.getFaceId() == faceIdCache) {
+            //相同人比对失败时清除失败人员，再比一次
+            verifyFaidVector.clear();
+            return maxFaceInfo;
+        } else if (maxFaceInfo.getFaceId() != faceIdCache) {
+            //不同人比一次
+            faceIdCache = maxFaceInfo.getFaceId();
+            return maxFaceInfo;
+        } else {
+            if (currentTime != 0) {
+                if (System.currentTimeMillis() - currentTime > App.regIntervals) {
+                    //同人比对成功时，3秒后再比一次
+                    currentTime = 0;
+                    return maxFaceInfo;
+                }
+            }
+            if (currentTime == 0) {
+                currentTime = System.currentTimeMillis();
+            }
+            return null;
+        }
+    }
+
+    @Override
+    public void onDestroyView() {
+        if (previewDiaposable != null && !previewDiaposable.isDisposed()) {
+            previewDiaposable.dispose();
+            previewDiaposable = null;
+        }
+        if (null != cameraRGB) {
+            try {
+//                cameraRGB.setPreviewCallback(null);
+                cameraRGB.stopPreview();
+                cameraRGB.setPreviewCallbackWithBuffer(null);
+                cameraRGB.release();
+                cameraRGB = null;
+            } catch (Exception e) {
+                AraLogger.e("CameraDualFragment中释放RGBCamera发生错误 " + e.getMessage());
+            }
+        }
+        if (verifyFaidVector != null) {
+            verifyFaidVector.clear();
+        }
+        overlayDialog.dismiss();
+        rgbData = null;
+        super.onDestroyView();
+    }
+
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+    }
+
+
+}
